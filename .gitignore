@@ -1,0 +1,38 @@
+# Build / arduino-cli
+build/
+*.elf
+*.bin
+*.hex
+*.map
+*.eep
+
+# Arduino IDE / local
+*.ino.cpp
+*.partitions.bin
+*.bootloader.bin
+*.merged.bin
+
+# PlatformIO (se usado no futuro)
+.pio/
+.vscode/.browse.c_cpp.db*
+.vscode/c_cpp_properties.json
+.vscode/launch.json
+.vscode/ipch
+
+# IDEs / editores
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Secrets / credenciais locais (nunca commitar)
+secrets.h
+wifi_credentials.h
+*.local.h
+
+# Logs e temporários
+*.log
+*.tmp
+.cache/
