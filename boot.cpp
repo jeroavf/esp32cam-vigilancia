@@ -42,7 +42,7 @@ void bootInit(void) {
 
     Serial.println();
     Serial.println(F("========================================"));
-    Serial.println(F(" ESP32-CAM Stream MVP"));
+    Serial.println(F(" ESP32-CAM Stream + MQTT"));
     Serial.println(F("========================================"));
     Serial.println(F("[BOOT] brownout detector disabled"));
     Serial.printf("[BOOT] reset reason: %d (%s)\n", (int)reason, resetReasonText(reason));

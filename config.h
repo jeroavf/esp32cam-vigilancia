@@ -56,3 +56,28 @@
 #define WEB_SERVER_PORT          80
 #define STREAM_SERVER_PORT       81
 #define STREAM_BOUNDARY          "frame"
+
+// ----- LED onboard (AI-Thinker ESP32-CAM) -----
+// GPIO 4 = flash branco (visível). GPIO 33 = LED vermelho (active-low).
+#define LED_GPIO                 4
+#define LED_ACTIVE_HIGH          1
+
+// ----- MQTT -----
+// Host vazio = MQTT desligado. Persistido em NVS (namespace mqttcfg).
+#define MQTT_PREFS_NS            "mqttcfg"
+#define MQTT_DEFAULT_HOST        ""
+#define MQTT_DEFAULT_PORT        1883
+#define MQTT_DEFAULT_USER        ""
+#define MQTT_DEFAULT_PASS        ""
+#define MQTT_DEFAULT_TOPIC_IN    "esp32cam/cmd"
+#define MQTT_DEFAULT_TOPIC_OUT   "esp32cam/image"
+#define MQTT_CLIENT_ID_PREFIX    "esp32cam-"
+#define MQTT_KEEPALIVE_SEC       30
+#define MQTT_RECONNECT_MS        5000
+// Buffer do pacote (JPEG VGA ~15–40 KB). Precisa caber header + payload.
+#define MQTT_BUFFER_SIZE         (48 * 1024)
+// Comandos no tópico de entrada (texto, case-insensitive)
+#define MQTT_CMD_CAPTURE         "capture"
+#define MQTT_CMD_LED_TOGGLE      "led_toggle"
+#define MQTT_CMD_LED_ON          "led_on"
+#define MQTT_CMD_LED_OFF         "led_off"

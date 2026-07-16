@@ -2,7 +2,7 @@
 
 **[English version](#english)**
 
-Firmware MVP para **ESP32-CAM AI-Thinker** com **shield CAM-MB**: stream de vídeo ao vivo (MJPEG) no navegador, na **rede local**, com Wi‑Fi via portal, **DHCP ou IP fixo**, e resolução/qualidade configuráveis na página.
+Firmware para **ESP32-CAM AI-Thinker** com **shield CAM-MB**: stream de vídeo ao vivo (MJPEG) no navegador, na **rede local**, com Wi‑Fi via portal, **DHCP ou IP fixo**, resolução/qualidade configuráveis na página, e **MQTT** (captura de imagem + toggle do LED flash).
 
 Este README reúne o **planejamento**, as **decisões de projeto**, a **arquitetura**, o **uso**, e os **acertos/aprendizados** obtidos durante implementação e testes.
 
@@ -16,50 +16,45 @@ Disponibilizar uma câmera IP simples e autônoma:
 - Configurar Wi‑Fi **sem recompilar** (portal captivo).
 - Escolher **DHCP ou IP fixo** dentro da LAN.
 - Ajustar **resolução e qualidade JPEG** pela interface web.
+- Receber **comandos MQTT** (captura JPEG + LED) e publicar a imagem em um tópico.
+- Configurar o broker MQTT **pela mesma página web** (sem recompilar).
 - Lidar com as limitações conhecidas do conjunto **ESP32-CAM + CAM-MB** (alimentação, boot, serial).
 
-### Fora do escopo do MVP
+### Fora do escopo atual
 
 | Item | Motivo |
 |------|--------|
 | Acesso pela internet | Complexidade (NAT, túnel, segurança) |
-| Autenticação (usuário/senha) | Rede local considerada suficiente no MVP |
-| Snapshot / gravação / microSD | Não pedidos no MVP |
-| LED flash, detecção de movimento, IA | Pós-MVP |
-| App nativo / Home Assistant | Integração futura opcional |
-| Vários clientes de stream simultâneos | Limitação do `WebServer` síncrono |
+| Autenticação HTTP (usuário/senha) | Rede local considerada suficiente |
+| Gravação contínua / microSD | Não implementado |
+| Detecção de movimento, IA | Pós-MVP |
+| Home Assistant MQTT discovery | Integração futura opcional |
+| TLS MQTT (`mqtts`) | Pós-MVP |
+| Vários viewers de stream simultâneos | Limitação prática de CPU/Wi‑Fi (1 cliente de stream é o alvo) |
 
 ---
 
-## 2. Planejamento e decisões (definição com o usuário)
-
-Decisões tomadas **antes** da implementação, em rodadas de perguntas:
+## 2. Planejamento e decisões
 
 | Tema | Decisão |
 |------|----------|
-| Objetivo principal | **Streaming ao vivo** |
+| Objetivo principal | **Streaming ao vivo** + **MQTT** (cmd → captura/LED) |
 | Cliente | **Navegador** (web) |
 | Rede | **Somente local** (Wi‑Fi de casa) |
 | Hardware | **ESP32-CAM-MB** (AI-Thinker + shield USB) |
 | Qualidade de imagem | **Configurável na página web** |
-| Autenticação | **Nenhuma** (rede local basta) |
-| Extras no MVP | **Só o stream** (mínimo viável) |
-| Wi‑Fi | **Portal WiFiManager** |
-| IP | **DHCP ou IP fixo** (configurável no portal, persistido em NVS) |
-| Entrega inicial | Plano primeiro; depois implementação do MVP |
+| Autenticação web | **Nenhuma** (rede local basta) |
+| Wi‑Fi | **Portal WiFiManager** (só rede/IP) |
+| IP | **DHCP ou IP fixo** (portal, NVS `netcfg`) |
+| MQTT | **Página web** (painel próprio + NVS `mqttcfg`) |
+| Stream HTTP | **Porta 80** (`/stream`, mesma origem da UI) |
 
-### Requisitos técnicos adicionados no plano
+### Requisitos técnicos
 
-1. **IP configurável**
-   - DHCP (padrão) ou estático (IP, gateway, máscara, DNS).
-   - Persistência em **Preferences/NVS** (sobrevive a reboot).
-   - Validação básica; IP inválido → fallback DHCP + log no Serial.
-   - Recomendação: IP fixo **fora do pool DHCP** do roteador.
-
-2. **Problemas de inicialização com CAM-MB**
-   - Brownout / picos de corrente com USB.
-   - Mitigações no firmware e documentação de hardware.
-   - Sequência de boot pensada para portal e estabilidade.
+1. **IP configurável** — DHCP ou estático; persistência NVS; fallback DHCP se inválido.
+2. **Estabilidade CAM-MB** — brownout off, settle no boot, portal antes da câmera.
+3. **MQTT** — host/porta/user/pass/tópicos na UI; comandos de texto; JPEG binário no tópico de saída.
+4. **Stream confiável** — não depender da porta 81 (em algumas redes ela não abre).
 
 ---
 
@@ -70,28 +65,38 @@ Decisões tomadas **antes** da implementação, em rodadas de perguntas:
         │
         │  http://IP/  ou  http://esp32cam.local/
         ▼
-┌───────────────────────────────────────┐
-│              ESP32-CAM                │
-│                                       │
-│  boot     → brownout off, logs        │
-│  network  → WiFiManager, DHCP/static  │
-│  camera   → OV2640, retry, framesize  │
-│  webserver→ HTML + MJPEG + /control   │
-└───────────────────────────────────────┘
+┌───────────────────────────────────────────┐
+│                 ESP32-CAM                 │
+│                                           │
+│  boot     → brownout off, logs            │
+│  led      → flash GPIO 4                  │
+│  network  → WiFiManager, DHCP/static      │
+│  camera   → OV2640, retry, framesize      │
+│  webserver→ UI + /stream + /control + MQTT│
+│  mqtt     → sub cmd / pub JPEG            │
+└───────────────────────────────────────────┘
+        │
+        │  MQTT (opcional)
+        ▼
+   [broker na LAN]
 ```
 
-### Ordem de boot (versão atual)
+### Ordem de boot
 
 ```
 1. Desliga brownout detector
 2. Settle + Serial (115200)
-3. Wi-Fi / portal WiFiManager   ← AP sobe cedo se não houver rede
-4. Câmera OV2640 (retry)
-5. Servidor HTTP (página + stream)
+3. LED init (GPIO 4)
+4. Wi-Fi / portal WiFiManager   ← AP sobe cedo se não houver rede
+5. Câmera OV2640 (retry)
+6. MQTT carrega prefs NVS (conecta se host + WiFi OK)
+7. Servidor HTTP (UI + /stream na porta 80; :81 opcional)
 ```
 
-> **Histórico:** a primeira versão iniciava a **câmera antes do Wi‑Fi** (menos pico simultâneo). Nos testes, isso **atrasava ou impedia** o AP de configuração se a câmera falhasse/reiniciasse.  
-> **Acerto:** portal **antes** da câmera — prioriza configuração e acesso à rede.
+> **Histórico:** a primeira versão iniciava a **câmera antes do Wi‑Fi**. Nos testes, isso atrasava ou impedia o AP de configuração.  
+> **Acerto:** portal **antes** da câmera.  
+> **Stream:** a UI usava `http://IP:81/stream`; em testes a **porta 81 não aceitava conexão** enquanto a 80 funcionava.  
+> **Acerto:** stream em **`/stream` na porta 80** (mesma origem).
 
 ### Stack
 
@@ -101,8 +106,10 @@ Decisões tomadas **antes** da implementação, em rodadas de perguntas:
 | Board FQBN | `esp32:esp32:esp32cam` |
 | Wi‑Fi config | WiFiManager 2.x |
 | Persistência IP | Preferences (NVS), namespace `netcfg` |
-| HTTP | `WebServer` (porta 80) |
-| Stream | MJPEG (`multipart/x-mixed-replace`) |
+| Persistência MQTT | Preferences (NVS), namespace `mqttcfg` |
+| MQTT | PubSubClient 2.x |
+| HTTP | `esp_http_server` (porta **80**; porta **81** opcional) |
+| Stream | MJPEG (`multipart/x-mixed-replace`) em `/stream` |
 | Descoberta | mDNS `esp32cam.local` (quando o SO resolver) |
 
 ### Estrutura de arquivos
@@ -110,15 +117,17 @@ Decisões tomadas **antes** da implementação, em rodadas de perguntas:
 ```
 esp32cam/
 ├── esp32cam.ino       # setup()/loop() — só orquestra
-├── config.h           # pinos, SSID do portal, defaults
+├── config.h           # pinos, SSID do portal, defaults MQTT/LED
 ├── boot.h / boot.cpp  # brownout, settle, motivo de reset
+├── led.h / led.cpp    # flash onboard (GPIO 4)
 ├── camera.h / camera.cpp
 ├── network.h / network.cpp
+├── mqtt.h / mqtt.cpp  # subscribe cmd + publish JPEG
 ├── webserver.h / webserver.cpp
 └── README.md          # este documento
 ```
 
-**Regra de modularização:** o `.ino` não implementa lógica de Wi‑Fi/câmera/HTTP; cada módulo expõe API em `.h` e esconde estado `static` no `.cpp`.
+**Regra de modularização:** o `.ino` não implementa lógica de Wi‑Fi/câmera/HTTP/MQTT; cada módulo expõe API em `.h` e esconde estado `static` no `.cpp`.
 
 ---
 
@@ -133,14 +142,18 @@ esp32cam/
 
 Definido em `config.h` — PWDN 32, XCLK 0, SIOD 26, SIOC 27, Y2–Y9, VSYNC 25, HREF 23, PCLK 22, etc.
 
+### LED
+
+| Uso | GPIO | Notas |
+|-----|------|--------|
+| Flash branco (toggle MQTT) | **4** | Active-high; brilhante |
+
 ### Placa no Arduino
 
 - Board: **AI Thinker ESP32-CAM**
 - PSRAM: **Enabled** quando a opção existir (melhora buffers de frame)
 
 ### Cuidados de alimentação (críticos)
-
-A ESP32-CAM puxa **picos altos** ao ligar Wi‑Fi e câmera. Com CAM-MB + porta USB fraca:
 
 | Sintoma | Causa típica |
 |---------|----------------|
@@ -149,29 +162,31 @@ A ESP32-CAM puxa **picos altos** ao ligar Wi‑Fi e câmera. Com CAM-MB + porta 
 | Funciona num PC e noutro não | Corrente da porta USB |
 | Trava ao abrir serial | Reset por DTR + boot pesado de novo |
 
-**Recomendações:**
-
-1. Cabo USB **curto** e de qualidade (dados + alimentação).  
-2. Preferir porta com boa corrente ou **hub USB alimentado**.  
-3. Se instável: fonte **5 V ≥ 1 A** em **5V/GND** da placa.  
-4. Opcional: capacitor **100–470 µF** entre 5V e GND.  
-5. Wi‑Fi da casa em **2.4 GHz** (ESP32 não usa 5 GHz).
+**Recomendações:** cabo USB curto e de qualidade; porta com boa corrente ou hub alimentado; se instável, fonte **5 V ≥ 1 A** em 5V/GND; Wi‑Fi **2.4 GHz**.
 
 ---
 
-## 5. Funcionalidades do MVP
+## 5. Funcionalidades
 
-### 5.1 Stream e página web
+### 5.1 Página web e stream
+
+A UI tem dois painéis:
+
+1. **Imagem** — resolução, qualidade JPEG, botão **Aplicar imagem**, status (IP, modo, MQTT, LED).
+2. **MQTT** — servidor, porta, usuário, senha, tópicos; botão próprio **Salvar MQTT**.
 
 | URL | Função |
 |-----|--------|
-| `http://IP/` | UI: preview + resolução + qualidade (porta **80**) |
-| `http://IP:81/stream` | Stream MJPEG contínuo (porta **81**, servidor separado) |
-| `http://IP/status` | JSON (IP, modo DHCP/STATIC, framesize, quality, heap, PSRAM) |
-| `http://IP/control?var=framesize&val=N` | Altera resolução (`framesize_t`) |
+| `http://IP/` | UI completa (porta **80**) |
+| `http://IP/stream` | Stream MJPEG (**porta 80**, mesma origem) |
+| `http://IP:81/stream` | Espelho opcional (só se o 2º servidor subir) |
+| `http://IP/status` | JSON de status (inclui MQTT e LED) |
+| `http://IP/control?var=framesize&val=N` | Altera resolução |
 | `http://IP/control?var=quality&val=N` | JPEG quality **10–63** (menor = melhor) |
+| `GET /mqtt` | JSON da config MQTT |
+| `POST /mqtt` | Salva MQTT (`application/x-www-form-urlencoded`) e reconecta |
 
-> **Por que duas portas?** Com um único `WebServer` síncrono, o `/stream` bloqueava a API: a página **não atualizava IP/modo** e o botão **Aplicar** não alterava framesize/quality. Solução (padrão Espressif): UI/API na **80**, stream na **81** via `esp_http_server`.
+> **Por que stream na 80?** Em testes, a porta **81 não abria** (timeout) enquanto a 80 respondia. Com `esp_http_server`, cada conexão tem worker próprio: API e stream convivem na mesma porta.
 
 Defaults no boot: **VGA (8)**, quality **12**.
 
@@ -184,19 +199,56 @@ Defaults no boot: **VGA (8)**, quality **12**.
 | URL do portal | `http://192.168.4.1` |
 | Hostname / mDNS | `esp32cam` → `http://esp32cam.local/` |
 
-Comportamento:
-
-- **Sem credenciais salvas:** abre o AP **na hora**, **sem timeout** (fica até configurar).  
+- **Sem credenciais salvas:** AP imediato, **sem timeout**.  
 - **Com credenciais:** tenta a rede salva; se falhar, reabre o portal.  
-- Campos extras no portal: IP fixo (0/1), IP, gateway, máscara, DNS.
+- Campos do portal: IP fixo (0/1), IP, gateway, máscara, DNS.  
+- **MQTT não está no portal** — configure na página web após a placa estar na LAN.
 
 ### 5.3 DHCP vs IP fixo
 
-1. Usuário escolhe no portal.  
-2. Valores vão para NVS (`netcfg`).  
-3. No boot: se estático → `WiFi.config(...)` **antes** de conectar.  
-4. Após portal com IP fixo: desconecta, reaplica config e reconecta (evita ficar só com DHCP da primeira associação).  
-5. Página e Serial mostram IP e modo (`DHCP` / `STATIC`).
+1. Escolha no portal → NVS (`netcfg`).  
+2. Boot estático: `WiFi.config(...)` **antes** de conectar.  
+3. Após portal com IP fixo: desconecta, reaplica e reconecta.  
+4. Página e Serial mostram `DHCP` ou `STATIC`.
+
+### 5.4 MQTT (comandos + imagem)
+
+Configurado em `http://IP/` → painel **MQTT** → **Salvar MQTT**. Persistido em NVS (`mqttcfg`).
+
+| Campo | Função |
+|-------|--------|
+| Servidor | Host/IP do broker (`vazio` = MQTT desligado) |
+| Porta | Padrão `1883` |
+| Usuário / senha | Opcional |
+| Tópico entrada | Subscribe — comandos de texto |
+| Tópico saída | Publish — JPEG binário |
+
+**Comandos** (payload texto, case-insensitive):
+
+| Payload | Ação |
+|---------|------|
+| `capture` / `snapshot` / `photo` | Captura 1 frame e publica JPEG no tópico de saída |
+| `led_toggle` / `led` / `toggle` | Alterna o LED flash (GPIO 4) |
+| `led_on` / `led_off` | Liga / desliga o LED |
+
+**Exemplo (mosquitto):**
+
+```bash
+# Terminal 1 — salvar a próxima imagem
+mosquitto_sub -h 192.168.1.10 -t 'esp32cam/image' -C 1 > /tmp/esp32cam.jpg
+
+# Terminal 2 — comandos
+mosquitto_pub -h 192.168.1.10 -t 'esp32cam/cmd' -m 'capture'
+mosquitto_pub -h 192.168.1.10 -t 'esp32cam/cmd' -m 'led_toggle'
+```
+
+**Notas:**
+
+- Host vazio desliga o cliente MQTT.  
+- Ao salvar na UI, a placa desconecta e reconecta **sem reboot**.  
+- Buffer padrão `48 KB` (`MQTT_BUFFER_SIZE`) — prefira VGA/SVGA para captura MQTT.  
+- Reconnect automático ~5 s se o broker cair.  
+- `/status` expõe `mqtt_enabled`, `mqtt_connected`, tópicos, `led`.
 
 ---
 
@@ -206,6 +258,7 @@ Comportamento:
 
 ```bash
 arduino-cli lib install WiFiManager
+arduino-cli lib install PubSubClient
 ```
 
 Core ESP32 instalado; FQBN: `esp32:esp32:esp32cam`.
@@ -224,7 +277,7 @@ arduino-cli board list
 # Upload (ajuste a porta)
 arduino-cli upload --fqbn esp32:esp32:esp32cam --port /dev/ttyUSB0 .
 
-# Monitor SEM forçar reset contínuo (muito importante no CAM-MB)
+# Monitor SEM forçar reset contínuo (importante no CAM-MB)
 stty -F /dev/ttyUSB0 -hupcl 2>/dev/null || true
 arduino-cli monitor --port /dev/ttyUSB0 --config baudrate=115200,dtr=off,rts=off
 ```
@@ -242,33 +295,27 @@ arduino-cli monitor --port /dev/ttyUSB0 --config baudrate=115200,dtr=off,rts=off
 ### Primeira configuração
 
 1. Grave o firmware e alimente a placa.  
-2. No celular/PC (**Wi‑Fi 2.4 GHz**), conecte em **`ESP32CAM-Setup`** (aberta).  
-3. Abra `http://192.168.4.1`.  
-4. Selecione a rede da casa + senha.  
-5. IP: `0` = DHCP · `1` = fixo (preencha IP/GW/máscara/DNS).  
-6. Salve e volte à Wi‑Fi da casa.  
-7. Acesse `http://IP/` (IP no Serial ou via nmap/roteador).
+2. No celular/PC (**Wi‑Fi 2.4 GHz**), conecte em **`ESP32CAM-Setup`**.  
+3. Abra `http://192.168.4.1` — configure SSID/senha e opcionalmente IP.  
+4. Volte à Wi‑Fi da casa.  
+5. Acesse `http://IP/` (IP no Serial, nmap ou roteador).  
+6. Ajuste resolução/qualidade se quiser.  
+7. No painel **MQTT**, preencha broker e tópicos → **Salvar MQTT**.
 
 ### Acessar o stream
 
 - Navegador na **mesma LAN**: `http://IP/`  
-- Atalho mDNS (se funcionar no SO): `http://esp32cam.local/`  
-- **Não use HTTPS** (só HTTP).  
-- Serial **não é necessária** para uso normal após o Wi‑Fi configurado.
+- Stream direto: `http://IP/stream`  
+- mDNS (se funcionar): `http://esp32cam.local/`  
+- **Não use HTTPS**.  
+- Serial **não é necessária** após o Wi‑Fi configurado.
 
 ### Achar o IP com nmap
 
-Troque a rede pelo prefixo da sua LAN (`ip -4 route`):
-
 ```bash
-# Hosts com porta 80 aberta
 nmap -p 80 --open 192.168.1.0/24
-
-# Só listar IPs candidatos
 nmap -p 80 --open -oG - 192.168.1.0/24 | awk '/80\/open/{print $2}'
 ```
-
-Para cada IP candidato: abrir `http://IP/` ou `curl -sI http://IP/`.
 
 ### Reconfigurar Wi‑Fi
 
@@ -285,119 +332,80 @@ void setup() {
 void loop() {}
 ```
 
-No boot seguinte, o AP **`ESP32CAM-Setup`** volta a aparecer.
+No boot seguinte, o AP **`ESP32CAM-Setup`** volta a aparecer.  
+A config MQTT em NVS (`mqttcfg`) **não** é apagada só por limpar o Wi‑Fi (a menos que faça erase completo da flash).
 
 ---
 
 ## 8. Acertos e aprendizados nos testes
 
-Registro do que foi observado e **corrigido** durante o uso real com CAM-MB.
-
 ### 8.1 AP `ESP32CAM-Setup` não aparecia
 
-| Hipótese | O que vimos | Acerto no firmware |
-|----------|-------------|--------------------|
-| Portal só depois da câmera | Init da OV2640 demora/falha/reinicia; usuário nunca vê o AP | **Wi‑Fi/portal primeiro**, câmera depois |
-| `autoConnect` com credenciais antigas | Tenta STA e atrasa o AP | Sem rede salva → **`startConfigPortal` imediato**, timeout 0 |
-| Celular em 5 GHz | ESP32 só 2.4 GHz | Documentar; canal AP fixo **1** |
-| AP “invisível” | Potência/canal | `WiFi.setTxPower` alto, canal 1, rede aberta, logs claros no Serial |
+| Hipótese | Acerto |
+|----------|--------|
+| Portal só depois da câmera | **Wi‑Fi/portal primeiro**, câmera depois |
+| `autoConnect` com credenciais antigas | Sem rede salva → **`startConfigPortal` imediato**, timeout 0 |
+| Celular em 5 GHz | Documentar; canal AP fixo **1** |
+| AP “invisível” | TX power alto, rede aberta, logs claros |
 
-**Mensagem esperada no Serial quando o portal está ativo:**
+### 8.2 Abrir a porta serial “trava” ou reseta
 
-```text
-[NET ] sem rede salva — abrindo AP "ESP32CAM-Setup" agora
-========================================
- PORTAL WiFi ATIVO
- SSID:  ESP32CAM-Setup
- Senha: (nenhuma — rede aberta)
- URL:   http://192.168.4.1
-========================================
-```
-
-### 8.2 Abrir a porta serial “trava” ou parece reset
-
-| Fato | Detalhe |
-|------|---------|
-| Causa | Shield USB (CH340 etc.) pulsa **DTR/RTS** → pino **RST** da ESP32 |
-| Efeito | **Um reboot** ao abrir o monitor é **normal** |
-| Loop de reset | Reboot + pico Wi‑Fi/câmera + USB fraco → brownout ou crash em loop |
-| Default ruim | `arduino-cli monitor` usa **`dtr=on`, `rts=on`** |
-
-**Acerto na prática:**
-
-```bash
-stty -F /dev/ttyUSB0 -hupcl 2>/dev/null || true
-arduino-cli monitor -p /dev/ttyUSB0 -c baudrate=115200,dtr=off,rts=off
-```
-
-**Acerto no firmware:**
-
-- Brownout desligado cedo.  
-- `BOOT_SETTLE_MS` maior (500 ms) após reset.  
-- Log do **motivo de reset** (`POWERON`, `EXT` = DTR/RST, `BROWNOUT`, `PANIC`, etc.).  
-- Dicas no Serial quando o motivo for `EXT` ou `BROWNOUT`.
-
-**Boa ordem de debug:** deixar a placa bootar ~10–15 s → só então abrir o monitor com DTR/RTS off.  
-Para só usar o stream, **não precisa** conectar serial.
+- Causa: shield USB pulsa **DTR/RTS** → **RST**. Um reboot ao abrir o monitor é **normal**.  
+- Monitor: `dtr=off,rts=off` + `stty -hupcl`.  
+- Firmware: brownout off, `BOOT_SETTLE_MS`, log do motivo de reset.
 
 ### 8.3 Brownout e alimentação
 
-| Mitigação de software | Mitigação de hardware |
-|----------------------|------------------------|
-| `WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0)` | Cabo/porta/fonte melhores |
-| Defaults VGA (não UXGA no boot) | 5 V externo ≥ 1 A se preciso |
-| Retry na câmera | Capacitor em 5V/GND se persistir |
-| Separar no tempo Wi‑Fi e câmera | Evitar cabo longo / hub sem alimentação |
+Software (brownout off, VGA no boot, retry, Wi‑Fi antes da câmera) + hardware (cabo/fonte/hub).
 
-Desligar o brownout **mascara** a queda de tensão para não ficar em loop de detecção; a corrente ainda precisa ser suficiente para Wi‑Fi + JPEG estáveis.
+### 8.4 Stream na página em preto (porta 81)
 
-### 8.4 IP e acesso após configurar o Wi‑Fi
+| Observação | Acerto |
+|------------|--------|
+| `http://IP/` e `/status` OK; `IP:81` timeout | Stream passou para **`/stream` na porta 80** |
+| UI apontava `hostname:81` | URL relativa `/stream` (mesma origem) |
+| 2º httpd na 81 | Opcional; falha não derruba a UI |
 
-Fluxo validado nos testes:
+### 8.5 Limitações confirmadas
 
-1. Portal configura SSID/senha (e opcionalmente IP).  
-2. Placa associa na LAN.  
-3. Serial (se estável) mostra `[NET ] WiFi OK IP=...` e `[HTTP] http://...`.  
-4. Sem serial: **nmap** na porta 80 ou lista de clientes do roteador.  
-5. Navegador: `http://IP/` — mesma rede, HTTP, 2.4 GHz.
-
-### 8.5 Limitações confirmadas no MVP
-
-- **Um cliente** de stream por vez: o handler de `/stream` bloqueia o `WebServer` enquanto a conexão MJPEG está aberta.  
-- Resoluções muito altas (SXGA/UXGA) exigem **PSRAM** e bom Wi‑Fi; se travar, voltar para **VGA/SVGA**.  
-- mDNS (`esp32cam.local`) depende do SO/rede (funciona melhor em Linux/macOS; Windows é inconsistente).
+- Preferir **um cliente** de stream por vez.  
+- SXGA/UXGA exigem **PSRAM** e bom Wi‑Fi; se travar, voltar a **VGA/SVGA**.  
+- mDNS depende do SO (melhor em Linux/macOS).  
+- JPEG MQTT limitado pelo buffer (`MQTT_BUFFER_SIZE`).  
+- Sem autenticação: **não exponha a porta 80 na internet**.
 
 ---
 
 ## 9. Logs úteis no Serial (boot saudável)
 
-Exemplo aproximado de sequência OK:
-
 ```text
 ========================================
- ESP32-CAM Stream MVP
+ ESP32-CAM Stream + MQTT
 ========================================
 [BOOT] brownout detector disabled
-[BOOT] reset reason: 1 (POWERON)   # ou EXT se abriu serial
-[BOOT] heap free=... psram=...
+[BOOT] reset reason: 1 (POWERON)
+[LED ] GPIO 4 init (off)
 [NET ] iniciando WiFi/portal (antes da camera)
 [NET ] modo DHCP (padrao)
 [NET ] credenciais WiFi salvas: sim
 [NET ] WiFi OK  IP=192.168.x.x  RSSI=...  mode=DHCP
-[HTTP] http://192.168.x.x/
 [CAM ] PSRAM found — fb_count=2
 [CAM ] init OK
+[MQTT] host=... port=1883 in=... out=...
+[MQTT] OK  out=...
+[HTTP] UI/API:  http://192.168.x.x/
+[HTTP] stream:  http://192.168.x.x/stream
 [MAIN] setup concluido
 ```
 
 | Sintoma no log | Ação |
 |----------------|------|
 | `reset reason: BROWNOUT` | Melhorar alimentação |
-| `reset reason: EXT` | Normal ao abrir serial; use dtr/rts off |
-| `reset reason: PANIC` | Crash de software — copiar stack se houver |
+| `reset reason: EXT` | Normal ao abrir serial; dtr/rts off |
 | `esp_camera_init failed` | Flat OV2640, board, PSRAM, energia |
-| Portal sem sumir e sem rede | Ainda no setup; configure ou apague credenciais |
-| WiFi OK mas página vazia | Testar `/stream`; baixar framesize |
+| `MQTT desligado (host vazio…)` | Configurar na página web |
+| `MQTT falha rc=…` | Broker, porta, user/pass, firewall |
+| WiFi OK mas imagem preta | Testar `http://IP/stream`; refresh forçado; VGA |
 
 ---
 
@@ -405,27 +413,29 @@ Exemplo aproximado de sequência OK:
 
 | Problema | O que fazer |
 |----------|-------------|
-| Não vejo `ESP32CAM-Setup` | Firmware atual? 2.4 GHz? Serial mostra portal? Sem credenciais antigas? Energia OK? |
-| Configurei Wi‑Fi e não acho a placa | nmap porta 80; roteador; Serial se possível |
-| Abrir Serial reinicia | Esperado no CAM-MB; `dtr=off,rts=off` + `stty -hupcl` |
-| Loop de reset | Fonte 5 V, cabo, hub alimentado; ver motivo no Serial |
-| Stream não carrega | Mesma rede; HTTP; um cliente; VGA; `/status` |
-| Quero mudar de rede | Apagar Wi‑Fi NVS / erase flash e reconfigurar portal |
-| Upload falha | IO0 + RST; driver CH340; cabo dados |
+| Não vejo `ESP32CAM-Setup` | Firmware atual? 2.4 GHz? Serial mostra portal? Energia OK? |
+| Configurei Wi‑Fi e não acho a placa | nmap porta 80; roteador; Serial |
+| Abrir Serial reinicia | Esperado no CAM-MB; `dtr=off,rts=off` |
+| Loop de reset | Fonte 5 V, cabo, hub alimentado |
+| Stream não carrega / tela preta | Use `http://IP/` (não `:81`); force refresh; `curl -I http://IP/stream`; VGA |
+| MQTT não conecta | Host/porta na UI; broker na LAN; Serial `[MQTT]` |
+| Capture MQTT falha | Buffer/resolução; confira tópico de saída |
+| LED não reage | Comando `led_toggle`; GPIO 4 |
+| Quero mudar de rede | Limpar Wi‑Fi NVS / erase flash + portal |
+| Upload falha | IO0 + RST; driver CH340; cabo de dados |
 
 ---
 
-## 11. Evolução futura (pós-MVP)
+## 11. Evolução futura
 
-Ideias alinhadas ao que ficou de fora, por prioridade sugerida:
-
-1. Botão/hold para **forçar portal** (reset de Wi‑Fi sem erase flash).  
-2. Snapshot (`/capture`) e opcional LED flash.  
-3. Autenticação HTTP básica se a LAN não for confiável.  
-4. `esp_http_server` assíncrono (vários viewers).  
-5. Integração Home Assistant / MQTT.  
-6. Gravação em microSD ou envio periódico de fotos.  
-7. Acesso remoto (túnel controlado + auth).
+1. Botão/hold para **forçar portal** (sem erase flash).  
+2. Snapshot HTTP (`/capture`) além do MQTT.  
+3. Autenticação HTTP básica.  
+4. Vários viewers de stream (se viável).  
+5. Home Assistant MQTT discovery.  
+6. TLS MQTT (`mqtts`), LWT / birth.  
+7. microSD ou fotos periódicas.  
+8. Acesso remoto (túnel + auth).
 
 ---
 
@@ -439,8 +449,14 @@ Ideias alinhadas ao que ficou de fora, por prioridade sugerida:
 | `CAM_DEFAULT_QUALITY` | `12` | JPEG (10–63) |
 | `CAM_INIT_RETRIES` | `5` | Tentativas de init da câmera |
 | `BOOT_SETTLE_MS` | `500` | Pausa pós-reset / serial |
-| `WEB_SERVER_PORT` | `80` | HTTP |
-| `NET_PREFS_NS` | `netcfg` | Namespace NVS do IP |
+| `WEB_SERVER_PORT` | `80` | HTTP UI + stream |
+| `STREAM_SERVER_PORT` | `81` | Espelho opcional do stream |
+| `NET_PREFS_NS` | `netcfg` | NVS do IP |
+| `MQTT_PREFS_NS` | `mqttcfg` | NVS MQTT |
+| `MQTT_DEFAULT_TOPIC_IN` | `esp32cam/cmd` | Tópico de comandos |
+| `MQTT_DEFAULT_TOPIC_OUT` | `esp32cam/image` | Tópico da imagem |
+| `MQTT_BUFFER_SIZE` | `48*1024` | Buffer do pacote MQTT |
+| `LED_GPIO` | `4` | Flash branco AI-Thinker |
 
 ---
 
@@ -448,24 +464,24 @@ Ideias alinhadas ao que ficou de fora, por prioridade sugerida:
 
 | Etapa | Resultado |
 |-------|-----------|
-| Definição de objetivo | Stream local no navegador, MVP mínimo |
-| Requisitos de IP e CAM-MB | DHCP/fixo + plano anti-brownout |
+| Definição de objetivo | Stream local no navegador |
+| IP e CAM-MB | DHCP/fixo + anti-brownout |
 | Implementação modular | boot, camera, network, webserver |
-| Compilação | OK com `esp32:esp32:esp32cam` |
-| Teste: AP não listado | Portal antes da câmera; `startConfigPortal` sem timeout |
-| Teste: Wi‑Fi configurado | Acesso via IP na LAN |
-| Teste: serial “trava” | Documentado DTR/RST; monitor com dtr/rts off; logs de reset |
-| Documentação | Este README unificado |
+| Compilação | OK `esp32:esp32:esp32cam` |
+| Testes portal / serial / alimentação | Correções documentadas |
+| MQTT | Comandos + JPEG + LED; config na página web |
+| Stream porta 81 inacessível | Stream movido para `/stream` na porta 80 |
+| Documentação | README PT + EN unificado |
 
 ---
 
 ## 14. Licença e uso
 
-Projeto de uso pessoal/estudo. Use apenas em redes em que você tem autorização. Sem autenticação no MVP: **não exponha a porta 80 na internet** sem camadas extras de segurança.
+Projeto de uso pessoal/estudo. Use apenas em redes em que você tem autorização. Sem autenticação: **não exponha a porta 80 na internet** sem camadas extras de segurança.
 
 ---
 
-*Documento gerado a partir do planejamento, implementação e testes do MVP ESP32-CAM Stream.*
+*Documento gerado a partir do planejamento, implementação e testes do ESP32-CAM Stream + MQTT.*
 
 ---
 ---
@@ -474,7 +490,7 @@ Projeto de uso pessoal/estudo. Use apenas em redes em que você tem autorizaçã
 
 # ESP32-CAM Stream — Project Documentation
 
-MVP firmware for **ESP32-CAM AI-Thinker** with **CAM-MB shield**: live video stream (MJPEG) in the browser, on the **local network**, with Wi‑Fi via portal, **DHCP or static IP**, and resolution/quality configurable on the page.
+Firmware for **ESP32-CAM AI-Thinker** with **CAM-MB shield**: live video stream (MJPEG) in the browser, on the **local network**, with Wi‑Fi via portal, **DHCP or static IP**, resolution/quality configurable on the page, and **MQTT** (image capture + flash LED toggle).
 
 This README gathers the **planning**, **design decisions**, **architecture**, **usage**, and the **fixes/lessons learned** from implementation and testing.
 
@@ -488,50 +504,45 @@ Provide a simple, self-contained IP camera:
 - Configure Wi‑Fi **without recompiling** (captive portal).
 - Choose **DHCP or static IP** on the LAN.
 - Adjust **resolution and JPEG quality** from the web UI.
+- Receive **MQTT commands** (JPEG capture + LED) and publish the image to a topic.
+- Configure the MQTT broker **from the same web page** (no recompile).
 - Handle known limitations of the **ESP32-CAM + CAM-MB** stack (power, boot, serial).
 
-### Out of MVP scope
+### Out of current scope
 
 | Item | Reason |
 |------|--------|
 | Internet access | Complexity (NAT, tunnel, security) |
-| Authentication (user/password) | Local network considered enough for MVP |
-| Snapshot / recording / microSD | Not requested in MVP |
-| Flash LED, motion detection, AI | Post-MVP |
-| Native app / Home Assistant | Optional future integration |
-| Multiple simultaneous stream clients | Limitation of the synchronous `WebServer` |
+| HTTP authentication (user/password) | Local network considered enough |
+| Continuous recording / microSD | Not implemented |
+| Motion detection, AI | Post-MVP |
+| Home Assistant MQTT discovery | Optional future integration |
+| TLS MQTT (`mqtts`) | Post-MVP |
+| Multiple simultaneous stream viewers | Practical CPU/Wi‑Fi limit (one stream client is the target) |
 
 ---
 
-## 2. Planning and decisions (agreed with the user)
-
-Decisions made **before** implementation, through rounds of questions:
+## 2. Planning and decisions
 
 | Topic | Decision |
 |-------|----------|
-| Main goal | **Live streaming** |
+| Main goal | **Live streaming** + **MQTT** (cmd → capture/LED) |
 | Client | **Browser** (web) |
 | Network | **Local only** (home Wi‑Fi) |
 | Hardware | **ESP32-CAM-MB** (AI-Thinker + USB shield) |
 | Image quality | **Configurable on the web page** |
-| Authentication | **None** (local network is enough) |
-| MVP extras | **Stream only** (minimum viable) |
-| Wi‑Fi | **WiFiManager portal** |
-| IP | **DHCP or static** (portal-configurable, persisted in NVS) |
-| Initial delivery | Plan first; then MVP implementation |
+| Web authentication | **None** (local network is enough) |
+| Wi‑Fi | **WiFiManager portal** (network/IP only) |
+| IP | **DHCP or static** (portal, NVS `netcfg`) |
+| MQTT | **Web page** (dedicated panel + NVS `mqttcfg`) |
+| HTTP stream | **Port 80** (`/stream`, same origin as the UI) |
 
-### Additional technical requirements added to the plan
+### Technical requirements
 
-1. **Configurable IP**
-   - DHCP (default) or static (IP, gateway, netmask, DNS).
-   - Persistence in **Preferences/NVS** (survives reboot).
-   - Basic validation; invalid IP → DHCP fallback + Serial log.
-   - Recommendation: static IP **outside the router’s DHCP pool**.
-
-2. **CAM-MB boot issues**
-   - Brownout / current spikes over USB.
-   - Firmware mitigations and hardware documentation.
-   - Boot sequence designed for portal availability and stability.
+1. **Configurable IP** — DHCP or static; NVS persistence; DHCP fallback if invalid.  
+2. **CAM-MB stability** — brownout off, boot settle, portal before camera.  
+3. **MQTT** — host/port/user/pass/topics in the UI; text commands; binary JPEG on output topic.  
+4. **Reliable stream** — do not depend on port 81 (it does not open on some networks).
 
 ---
 
@@ -542,28 +553,38 @@ Decisions made **before** implementation, through rounds of questions:
         │
         │  http://IP/  or  http://esp32cam.local/
         ▼
-┌───────────────────────────────────────┐
-│              ESP32-CAM                │
-│                                       │
-│  boot     → brownout off, logs        │
-│  network  → WiFiManager, DHCP/static  │
-│  camera   → OV2640, retry, framesize  │
-│  webserver→ HTML + MJPEG + /control   │
-└───────────────────────────────────────┘
+┌───────────────────────────────────────────┐
+│                 ESP32-CAM                 │
+│                                           │
+│  boot     → brownout off, logs            │
+│  led      → flash GPIO 4                  │
+│  network  → WiFiManager, DHCP/static      │
+│  camera   → OV2640, retry, framesize      │
+│  webserver→ UI + /stream + /control + MQTT│
+│  mqtt     → sub cmd / pub JPEG            │
+└───────────────────────────────────────────┘
+        │
+        │  MQTT (optional)
+        ▼
+   [broker on LAN]
 ```
 
-### Boot order (current version)
+### Boot order
 
 ```
 1. Disable brownout detector
 2. Settle + Serial (115200)
-3. Wi-Fi / WiFiManager portal   ← AP comes up early if no network
-4. OV2640 camera (retry)
-5. HTTP server (page + stream)
+3. LED init (GPIO 4)
+4. Wi-Fi / WiFiManager portal   ← AP comes up early if no network
+5. OV2640 camera (retry)
+6. MQTT loads NVS prefs (connects if host + WiFi OK)
+7. HTTP server (UI + /stream on port 80; :81 optional)
 ```
 
-> **History:** the first version started the **camera before Wi‑Fi** (less simultaneous peak load). In testing, that **delayed or prevented** the config AP if the camera failed/rebooted.  
-> **Fix:** portal **before** the camera — prioritizes configuration and network access.
+> **History:** the first version started the **camera before Wi‑Fi**. In testing, that delayed or prevented the config AP.  
+> **Fix:** portal **before** the camera.  
+> **Stream:** the UI used `http://IP:81/stream`; in tests **port 81 timed out** while port 80 worked.  
+> **Fix:** stream at **`/stream` on port 80** (same origin).
 
 ### Stack
 
@@ -573,8 +594,10 @@ Decisions made **before** implementation, through rounds of questions:
 | Board FQBN | `esp32:esp32:esp32cam` |
 | Wi‑Fi config | WiFiManager 2.x |
 | IP persistence | Preferences (NVS), namespace `netcfg` |
-| HTTP | `WebServer` (port 80) |
-| Stream | MJPEG (`multipart/x-mixed-replace`) |
+| MQTT persistence | Preferences (NVS), namespace `mqttcfg` |
+| MQTT | PubSubClient 2.x |
+| HTTP | `esp_http_server` (port **80**; port **81** optional) |
+| Stream | MJPEG (`multipart/x-mixed-replace`) at `/stream` |
 | Discovery | mDNS `esp32cam.local` (when the OS resolves it) |
 
 ### File structure
@@ -582,15 +605,17 @@ Decisions made **before** implementation, through rounds of questions:
 ```
 esp32cam/
 ├── esp32cam.ino       # setup()/loop() — orchestration only
-├── config.h           # pins, portal SSID, defaults
+├── config.h           # pins, portal SSID, MQTT/LED defaults
 ├── boot.h / boot.cpp  # brownout, settle, reset reason
+├── led.h / led.cpp    # onboard flash (GPIO 4)
 ├── camera.h / camera.cpp
 ├── network.h / network.cpp
+├── mqtt.h / mqtt.cpp  # subscribe cmd + publish JPEG
 ├── webserver.h / webserver.cpp
 └── README.md          # this document
 ```
 
-**Modularization rule:** the `.ino` does not implement Wi‑Fi/camera/HTTP logic; each module exposes an API in `.h` and hides `static` state in the `.cpp`.
+**Modularization rule:** the `.ino` does not implement Wi‑Fi/camera/HTTP/MQTT logic; each module exposes an API in `.h` and hides `static` state in the `.cpp`.
 
 ---
 
@@ -605,14 +630,18 @@ esp32cam/
 
 Defined in `config.h` — PWDN 32, XCLK 0, SIOD 26, SIOC 27, Y2–Y9, VSYNC 25, HREF 23, PCLK 22, etc.
 
+### LED
+
+| Use | GPIO | Notes |
+|-----|------|--------|
+| White flash (MQTT toggle) | **4** | Active-high; bright |
+
 ### Board settings in Arduino
 
 - Board: **AI Thinker ESP32-CAM**
 - PSRAM: **Enabled** when the option exists (improves frame buffers)
 
 ### Power supply notes (critical)
-
-The ESP32-CAM draws **high current peaks** when Wi‑Fi and the camera start. With CAM-MB + a weak USB port:
 
 | Symptom | Typical cause |
 |---------|----------------|
@@ -621,29 +650,31 @@ The ESP32-CAM draws **high current peaks** when Wi‑Fi and the camera start. Wi
 | Works on one PC, not another | USB port current |
 | Freezes when opening serial | Reset via DTR + heavy boot again |
 
-**Recommendations:**
-
-1. **Short**, good-quality USB cable (data + power).  
-2. Prefer a high-current port or a **powered USB hub**.  
-3. If unstable: **5 V ≥ 1 A** supply on the board’s **5V/GND**.  
-4. Optional: **100–470 µF** capacitor between 5V and GND.  
-5. Home Wi‑Fi on **2.4 GHz** (ESP32 does not use 5 GHz).
+**Recommendations:** short good USB cable; high-current port or powered hub; if unstable, **5 V ≥ 1 A** on 5V/GND; home Wi‑Fi on **2.4 GHz**.
 
 ---
 
-## 5. MVP features
+## 5. Features
 
-### 5.1 Stream and web page
+### 5.1 Web page and stream
+
+The UI has two panels:
+
+1. **Image** — resolution, JPEG quality, **Apply image** button, status (IP, mode, MQTT, LED).
+2. **MQTT** — server, port, user, password, topics; dedicated **Save MQTT** button.
 
 | URL | Function |
 |-----|----------|
-| `http://IP/` | UI: preview + resolution + quality (port **80**) |
-| `http://IP:81/stream` | Continuous MJPEG stream (port **81**, separate server) |
-| `http://IP/status` | JSON (IP, DHCP/STATIC mode, framesize, quality, heap, PSRAM) |
-| `http://IP/control?var=framesize&val=N` | Change resolution (`framesize_t`) |
+| `http://IP/` | Full UI (port **80**) |
+| `http://IP/stream` | Continuous MJPEG (**port 80**, same origin) |
+| `http://IP:81/stream` | Optional mirror (only if the 2nd server starts) |
+| `http://IP/status` | Status JSON (includes MQTT and LED) |
+| `http://IP/control?var=framesize&val=N` | Change resolution |
 | `http://IP/control?var=quality&val=N` | JPEG quality **10–63** (lower = better) |
+| `GET /mqtt` | MQTT config JSON |
+| `POST /mqtt` | Save MQTT (`application/x-www-form-urlencoded`) and reconnect |
 
-> **Why two ports?** With a single synchronous `WebServer`, `/stream` blocked the API: the page **did not refresh IP/mode** and the **Apply** button did not change framesize/quality. Solution (Espressif pattern): UI/API on **80**, stream on **81** via `esp_http_server`.
+> **Why stream on 80?** In testing, port **81 did not accept connections** (timeout) while 80 responded. With `esp_http_server`, each connection has its own worker: API and stream coexist on the same port.
 
 Boot defaults: **VGA (8)**, quality **12**.
 
@@ -656,19 +687,56 @@ Boot defaults: **VGA (8)**, quality **12**.
 | Portal URL | `http://192.168.4.1` |
 | Hostname / mDNS | `esp32cam` → `http://esp32cam.local/` |
 
-Behavior:
-
-- **No saved credentials:** opens the AP **immediately**, **no timeout** (stays until configured).  
+- **No saved credentials:** AP immediately, **no timeout**.  
 - **With credentials:** tries the saved network; on failure, reopens the portal.  
-- Extra portal fields: static IP (0/1), IP, gateway, netmask, DNS.
+- Portal fields: static IP (0/1), IP, gateway, netmask, DNS.  
+- **MQTT is not in the portal** — configure it on the web page after the board is on the LAN.
 
 ### 5.3 DHCP vs static IP
 
-1. User chooses in the portal.  
-2. Values go to NVS (`netcfg`).  
-3. On boot: if static → `WiFi.config(...)` **before** connecting.  
-4. After portal with static IP: disconnect, reapply config, reconnect (avoids staying on DHCP from the first association).  
-5. Page and Serial show IP and mode (`DHCP` / `STATIC`).
+1. Choose in the portal → NVS (`netcfg`).  
+2. Static boot: `WiFi.config(...)` **before** connecting.  
+3. After portal with static IP: disconnect, reapply, reconnect.  
+4. Page and Serial show `DHCP` or `STATIC`.
+
+### 5.4 MQTT (commands + image)
+
+Configured at `http://IP/` → **MQTT** panel → **Save MQTT**. Persisted in NVS (`mqttcfg`).
+
+| Field | Function |
+|-------|----------|
+| Server | Broker host/IP (`empty` = MQTT off) |
+| Port | Default `1883` |
+| User / password | Optional |
+| Input topic | Subscribe — text commands |
+| Output topic | Publish — binary JPEG |
+
+**Commands** (text payload, case-insensitive):
+
+| Payload | Action |
+|---------|--------|
+| `capture` / `snapshot` / `photo` | Capture one frame and publish JPEG on the output topic |
+| `led_toggle` / `led` / `toggle` | Toggle flash LED (GPIO 4) |
+| `led_on` / `led_off` | Turn LED on / off |
+
+**Example (mosquitto):**
+
+```bash
+# Terminal 1 — save the next image
+mosquitto_sub -h 192.168.1.10 -t 'esp32cam/image' -C 1 > /tmp/esp32cam.jpg
+
+# Terminal 2 — commands
+mosquitto_pub -h 192.168.1.10 -t 'esp32cam/cmd' -m 'capture'
+mosquitto_pub -h 192.168.1.10 -t 'esp32cam/cmd' -m 'led_toggle'
+```
+
+**Notes:**
+
+- Empty host disables the MQTT client.  
+- Saving in the UI disconnects and reconnects **without reboot**.  
+- Default buffer `48 KB` (`MQTT_BUFFER_SIZE`) — prefer VGA/SVGA for MQTT capture.  
+- Automatic reconnect ~5 s if the broker drops.  
+- `/status` exposes `mqtt_enabled`, `mqtt_connected`, topics, `led`.
 
 ---
 
@@ -678,6 +746,7 @@ Behavior:
 
 ```bash
 arduino-cli lib install WiFiManager
+arduino-cli lib install PubSubClient
 ```
 
 ESP32 core installed; FQBN: `esp32:esp32:esp32cam`.
@@ -696,7 +765,7 @@ arduino-cli board list
 # Upload (adjust the port)
 arduino-cli upload --fqbn esp32:esp32:esp32cam --port /dev/ttyUSB0 .
 
-# Monitor WITHOUT continuous forced reset (very important on CAM-MB)
+# Monitor WITHOUT continuous forced reset (important on CAM-MB)
 stty -F /dev/ttyUSB0 -hupcl 2>/dev/null || true
 arduino-cli monitor --port /dev/ttyUSB0 --config baudrate=115200,dtr=off,rts=off
 ```
@@ -714,33 +783,27 @@ arduino-cli monitor --port /dev/ttyUSB0 --config baudrate=115200,dtr=off,rts=off
 ### First-time setup
 
 1. Flash the firmware and power the board.  
-2. On phone/PC (**2.4 GHz Wi‑Fi**), connect to **`ESP32CAM-Setup`** (open).  
-3. Open `http://192.168.4.1`.  
-4. Select home network + password.  
-5. IP: `0` = DHCP · `1` = static (fill IP/GW/netmask/DNS).  
-6. Save and return to home Wi‑Fi.  
-7. Open `http://IP/` (IP from Serial or via nmap/router).
+2. On phone/PC (**2.4 GHz Wi‑Fi**), connect to **`ESP32CAM-Setup`**.  
+3. Open `http://192.168.4.1` — set SSID/password and optionally IP.  
+4. Return to home Wi‑Fi.  
+5. Open `http://IP/` (IP from Serial, nmap, or router).  
+6. Adjust resolution/quality if desired.  
+7. In the **MQTT** panel, fill broker and topics → **Save MQTT**.
 
 ### Accessing the stream
 
 - Browser on the **same LAN**: `http://IP/`  
-- mDNS shortcut (if the OS supports it): `http://esp32cam.local/`  
-- **Do not use HTTPS** (HTTP only).  
-- Serial is **not required** for normal use after Wi‑Fi is configured.
+- Direct stream: `http://IP/stream`  
+- mDNS (if supported): `http://esp32cam.local/`  
+- **Do not use HTTPS**.  
+- Serial is **not required** after Wi‑Fi is configured.
 
 ### Finding the IP with nmap
 
-Replace the network with your LAN prefix (`ip -4 route`):
-
 ```bash
-# Hosts with port 80 open
 nmap -p 80 --open 192.168.1.0/24
-
-# List candidate IPs only
 nmap -p 80 --open -oG - 192.168.1.0/24 | awk '/80\/open/{print $2}'
 ```
-
-For each candidate IP: open `http://IP/` or `curl -sI http://IP/`.
 
 ### Reconfiguring Wi‑Fi
 
@@ -757,119 +820,80 @@ void setup() {
 void loop() {}
 ```
 
-On the next boot, the **`ESP32CAM-Setup`** AP appears again.
+On the next boot, the **`ESP32CAM-Setup`** AP appears again.  
+MQTT config in NVS (`mqttcfg`) is **not** cleared by Wi‑Fi-only reset (unless you erase the full flash).
 
 ---
 
 ## 8. Fixes and lessons from testing
 
-What was observed and **fixed** during real use with CAM-MB.
-
 ### 8.1 `ESP32CAM-Setup` AP did not appear
 
-| Hypothesis | What we saw | Firmware fix |
-|------------|-------------|--------------|
-| Portal only after camera | OV2640 init is slow/fails/reboots; user never sees the AP | **Wi‑Fi/portal first**, camera later |
-| `autoConnect` with old credentials | Tries STA and delays the AP | No saved network → **immediate `startConfigPortal`**, timeout 0 |
-| Phone on 5 GHz | ESP32 is 2.4 GHz only | Document; AP channel fixed to **1** |
-| AP “invisible” | Power/channel | High `WiFi.setTxPower`, channel 1, open network, clear Serial logs |
+| Hypothesis | Fix |
+|------------|-----|
+| Portal only after camera | **Wi‑Fi/portal first**, camera later |
+| `autoConnect` with old credentials | No saved network → **immediate `startConfigPortal`**, timeout 0 |
+| Phone on 5 GHz | Document; AP channel fixed to **1** |
+| AP “invisible” | High TX power, open network, clear logs |
 
-**Expected Serial message when the portal is active:**
+### 8.2 Opening serial “freezes” or resets
 
-```text
-[NET ] sem rede salva — abrindo AP "ESP32CAM-Setup" agora
-========================================
- PORTAL WiFi ATIVO
- SSID:  ESP32CAM-Setup
- Senha: (nenhuma — rede aberta)
- URL:   http://192.168.4.1
-========================================
-```
-
-### 8.2 Opening the serial port “freezes” or looks like a reset
-
-| Fact | Detail |
-|------|--------|
-| Cause | USB shield (CH340 etc.) pulses **DTR/RTS** → ESP32 **RST** pin |
-| Effect | **One reboot** when opening the monitor is **normal** |
-| Reset loop | Reboot + Wi‑Fi/camera peak + weak USB → brownout or crash loop |
-| Bad default | `arduino-cli monitor` uses **`dtr=on`, `rts=on`** |
-
-**Practical fix:**
-
-```bash
-stty -F /dev/ttyUSB0 -hupcl 2>/dev/null || true
-arduino-cli monitor -p /dev/ttyUSB0 -c baudrate=115200,dtr=off,rts=off
-```
-
-**Firmware fixes:**
-
-- Brownout disabled early.  
-- Larger `BOOT_SETTLE_MS` (500 ms) after reset.  
-- Log of **reset reason** (`POWERON`, `EXT` = DTR/RST, `BROWNOUT`, `PANIC`, etc.).  
-- Serial tips when reason is `EXT` or `BROWNOUT`.
-
-**Good debug order:** let the board boot ~10–15 s → only then open the monitor with DTR/RTS off.  
-To only use the stream, serial is **not needed**.
+- Cause: USB shield pulses **DTR/RTS** → **RST**. One reboot when opening the monitor is **normal**.  
+- Monitor: `dtr=off,rts=off` + `stty -hupcl`.  
+- Firmware: brownout off, `BOOT_SETTLE_MS`, reset-reason log.
 
 ### 8.3 Brownout and power
 
-| Software mitigation | Hardware mitigation |
-|---------------------|---------------------|
-| `WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0)` | Better cable/port/supply |
-| VGA defaults (not UXGA at boot) | External 5 V ≥ 1 A if needed |
-| Camera retry | Capacitor on 5V/GND if it persists |
-| Stagger Wi‑Fi and camera in time | Avoid long cable / unpowered hub |
+Software (brownout off, VGA at boot, retry, Wi‑Fi before camera) + hardware (cable/supply/hub).
 
-Disabling brownout **masks** voltage sag so detection does not loop; current still needs to be enough for stable Wi‑Fi + JPEG.
+### 8.4 Black stream on the page (port 81)
 
-### 8.4 IP and access after configuring Wi‑Fi
+| Observation | Fix |
+|-------------|-----|
+| `http://IP/` and `/status` OK; `IP:81` timeout | Stream moved to **`/stream` on port 80** |
+| UI pointed at `hostname:81` | Relative URL `/stream` (same origin) |
+| Second httpd on 81 | Optional; failure does not take down the UI |
 
-Flow validated in tests:
+### 8.5 Confirmed limitations
 
-1. Portal configures SSID/password (and optionally IP).  
-2. Board joins the LAN.  
-3. Serial (if stable) shows `[NET ] WiFi OK IP=...` and `[HTTP] http://...`.  
-4. Without serial: **nmap** on port 80 or the router’s client list.  
-5. Browser: `http://IP/` — same network, HTTP, 2.4 GHz.
-
-### 8.5 Confirmed MVP limitations
-
-- **One stream client** at a time: the `/stream` handler blocks the `WebServer` while the MJPEG connection is open.  
-- Very high resolutions (SXGA/UXGA) need **PSRAM** and good Wi‑Fi; if it hangs, drop back to **VGA/SVGA**.  
-- mDNS (`esp32cam.local`) depends on OS/network (works better on Linux/macOS; Windows is inconsistent).
+- Prefer **one stream client** at a time.  
+- SXGA/UXGA need **PSRAM** and good Wi‑Fi; if it hangs, drop to **VGA/SVGA**.  
+- mDNS depends on the OS (better on Linux/macOS).  
+- MQTT JPEG limited by buffer (`MQTT_BUFFER_SIZE`).  
+- No authentication: **do not expose port 80 to the internet**.
 
 ---
 
 ## 9. Useful Serial logs (healthy boot)
 
-Approximate OK sequence:
-
 ```text
 ========================================
- ESP32-CAM Stream MVP
+ ESP32-CAM Stream + MQTT
 ========================================
 [BOOT] brownout detector disabled
-[BOOT] reset reason: 1 (POWERON)   # or EXT if serial was opened
-[BOOT] heap free=... psram=...
+[BOOT] reset reason: 1 (POWERON)
+[LED ] GPIO 4 init (off)
 [NET ] iniciando WiFi/portal (antes da camera)
 [NET ] modo DHCP (padrao)
 [NET ] credenciais WiFi salvas: sim
 [NET ] WiFi OK  IP=192.168.x.x  RSSI=...  mode=DHCP
-[HTTP] http://192.168.x.x/
 [CAM ] PSRAM found — fb_count=2
 [CAM ] init OK
+[MQTT] host=... port=1883 in=... out=...
+[MQTT] OK  out=...
+[HTTP] UI/API:  http://192.168.x.x/
+[HTTP] stream:  http://192.168.x.x/stream
 [MAIN] setup concluido
 ```
 
 | Log symptom | Action |
 |-------------|--------|
 | `reset reason: BROWNOUT` | Improve power supply |
-| `reset reason: EXT` | Normal when opening serial; use dtr/rts off |
-| `reset reason: PANIC` | Software crash — copy stack if available |
+| `reset reason: EXT` | Normal when opening serial; dtr/rts off |
 | `esp_camera_init failed` | OV2640 ribbon, board, PSRAM, power |
-| Portal never goes away / no network | Still in setup; configure or clear credentials |
-| WiFi OK but blank page | Test `/stream`; lower framesize |
+| `MQTT desligado (host vazio…)` | Configure on the web page |
+| `MQTT falha rc=…` | Broker, port, user/pass, firewall |
+| WiFi OK but black image | Test `http://IP/stream`; hard refresh; VGA |
 
 ---
 
@@ -877,27 +901,29 @@ Approximate OK sequence:
 
 | Problem | What to do |
 |---------|------------|
-| Cannot see `ESP32CAM-Setup` | Current firmware? 2.4 GHz? Serial shows portal? No old credentials? Power OK? |
-| Configured Wi‑Fi but cannot find the board | nmap port 80; router; Serial if possible |
-| Opening Serial reboots | Expected on CAM-MB; `dtr=off,rts=off` + `stty -hupcl` |
-| Reset loop | 5 V supply, cable, powered hub; check reason on Serial |
-| Stream does not load | Same network; HTTP; one client; VGA; `/status` |
-| Want to change network | Clear Wi‑Fi NVS / erase flash and reconfigure portal |
+| Cannot see `ESP32CAM-Setup` | Current firmware? 2.4 GHz? Serial shows portal? Power OK? |
+| Configured Wi‑Fi but cannot find the board | nmap port 80; router; Serial |
+| Opening Serial reboots | Expected on CAM-MB; `dtr=off,rts=off` |
+| Reset loop | 5 V supply, cable, powered hub |
+| Stream does not load / black screen | Use `http://IP/` (not `:81`); hard refresh; `curl -I http://IP/stream`; VGA |
+| MQTT does not connect | Host/port in UI; broker on LAN; Serial `[MQTT]` |
+| MQTT capture fails | Buffer/resolution; check output topic |
+| LED does not respond | Command `led_toggle`; GPIO 4 |
+| Want to change network | Clear Wi‑Fi NVS / erase flash + portal |
 | Upload fails | IO0 + RST; CH340 driver; data cable |
 
 ---
 
-## 11. Future evolution (post-MVP)
+## 11. Future evolution
 
-Ideas aligned with what was left out, by suggested priority:
-
-1. Button/hold to **force portal** (Wi‑Fi reset without flash erase).  
-2. Snapshot (`/capture`) and optional flash LED.  
-3. Basic HTTP auth if the LAN is not trusted.  
-4. Async `esp_http_server` (multiple viewers).  
-5. Home Assistant / MQTT integration.  
-6. microSD recording or periodic photo upload.  
-7. Remote access (controlled tunnel + auth).
+1. Button/hold to **force portal** (no flash erase).  
+2. HTTP snapshot (`/capture`) in addition to MQTT.  
+3. Basic HTTP authentication.  
+4. Multiple stream viewers (if feasible).  
+5. Home Assistant MQTT discovery.  
+6. TLS MQTT (`mqtts`), LWT / birth.  
+7. microSD or periodic photos.  
+8. Remote access (tunnel + auth).
 
 ---
 
@@ -911,8 +937,14 @@ Ideas aligned with what was left out, by suggested priority:
 | `CAM_DEFAULT_QUALITY` | `12` | JPEG (10–63) |
 | `CAM_INIT_RETRIES` | `5` | Camera init attempts |
 | `BOOT_SETTLE_MS` | `500` | Post-reset / serial pause |
-| `WEB_SERVER_PORT` | `80` | HTTP |
-| `NET_PREFS_NS` | `netcfg` | NVS namespace for IP |
+| `WEB_SERVER_PORT` | `80` | HTTP UI + stream |
+| `STREAM_SERVER_PORT` | `81` | Optional stream mirror |
+| `NET_PREFS_NS` | `netcfg` | NVS for IP |
+| `MQTT_PREFS_NS` | `mqttcfg` | NVS for MQTT |
+| `MQTT_DEFAULT_TOPIC_IN` | `esp32cam/cmd` | Command topic |
+| `MQTT_DEFAULT_TOPIC_OUT` | `esp32cam/image` | Image topic |
+| `MQTT_BUFFER_SIZE` | `48*1024` | MQTT packet buffer |
+| `LED_GPIO` | `4` | AI-Thinker white flash |
 
 ---
 
@@ -920,21 +952,21 @@ Ideas aligned with what was left out, by suggested priority:
 
 | Stage | Outcome |
 |-------|---------|
-| Goal definition | Local browser stream, minimal MVP |
-| IP and CAM-MB requirements | DHCP/static + anti-brownout plan |
+| Goal definition | Local browser stream |
+| IP and CAM-MB | DHCP/static + anti-brownout |
 | Modular implementation | boot, camera, network, webserver |
-| Build | OK with `esp32:esp32:esp32cam` |
-| Test: AP not listed | Portal before camera; `startConfigPortal` with no timeout |
-| Test: Wi‑Fi configured | Access via LAN IP |
-| Test: serial “freezes” | Documented DTR/RST; monitor with dtr/rts off; reset logs |
-| Documentation | This unified README |
+| Build | OK `esp32:esp32:esp32cam` |
+| Portal / serial / power tests | Documented fixes |
+| MQTT | Commands + JPEG + LED; config on web page |
+| Stream port 81 unreachable | Stream moved to `/stream` on port 80 |
+| Documentation | Unified PT + EN README |
 
 ---
 
 ## 14. License and usage
 
-Personal/study project. Use only on networks you are authorized to use. No authentication in the MVP: **do not expose port 80 to the internet** without extra security layers.
+Personal/study project. Use only on networks you are authorized to use. No authentication: **do not expose port 80 to the internet** without extra security layers.
 
 ---
 
-*Document produced from the planning, implementation, and testing of the ESP32-CAM Stream MVP.*
+*Document produced from the planning, implementation, and testing of the ESP32-CAM Stream + MQTT project.*
